@@ -107,7 +107,14 @@ curl http://localhost:8765/state
 - 帧构建格式参考
 - 设备初始化流程参考
 - Web Bluetooth 桥接方案参考
+- 这个是链接的啵啵贝pro（ios）
+https://github.com/29-Cu/succhia 这两个是链接啵啵贝（旧版、但应用一样）
+https://github.com/51enuxu/sosexy-ble-control
+https://github.com/tutu-kitty/Toy-Relay-AI-mcp-SOSEXY
 
+这个不是成品方案，但是可以提供思路
+https://github.com/Lumenocturne/bobo-bridge
+感谢这些老师！！！
 ## License
 
 MIT
