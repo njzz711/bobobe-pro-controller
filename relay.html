@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>啵啵贝桥接</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:20px}
+.container{max-width:480px;width:100%}
+h1{font-size:18px;text-align:center;margin-bottom:20px;color:#7eb8da}
+.status-bar{background:#16213e;border-radius:12px;padding:16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
+.status-dot{width:10px;height:10px;border-radius:50%;background:#555;transition:background .3s}
+.status-dot.online{background:#4ecca3;box-shadow:0 0 8px #4ecca3}
+.status-dot.ble{background:#4ecca3;box-shadow:0 0 8px #4ecca3}
+.status-text{font-size:13px;flex:1;margin-left:12px}
+.btn{width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;margin-bottom:12px}
+.btn-connect{background:#4ecca3;color:#1a1a2e}
+.btn-connect:active{transform:scale(.97)}
+.btn-connect:disabled{background:#333;color:#666;cursor:not-allowed}
+.btn-stop{background:#e94560;color:#fff}
+.btn-stop:active{transform:scale(.97)}
+.motor-display{background:#16213e;border-radius:12px;padding:16px;margin-bottom:12px}
+.motor-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0f3460}
+.motor-row:last-child{border-bottom:none}
+.motor-label{font-size:14px;color:#a0a0a0}
+.motor-value{font-size:18px;font-weight:700;color:#7eb8da;font-variant-numeric:tabular-nums}
+.motor-value.active{color:#4ecca3}
+.log{background:#0f0f23;border-radius:10px;padding:12px;font-size:11px;font-family:monospace;color:#666;max-height:150px;overflow-y:auto;margin-top:12px;border:1px solid #0f3460}
+.log div{padding:2px 0;border-bottom:1px solid #111}
+.log div:last-child{border-bottom:none}
+.hint{font-size:12px;color:#555;text-align:center;margin-top:16px;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>啵啵贝 BLE 桥接</h1>
+
+<div class="status-bar">
+<div class="status-dot" id="dot-server"></div>
+<div class="status-text" id="text-server">服务未连接</div>
+</div>
+
+<div class="status-bar">
+<div class="status-dot" id="dot-ble"></div>
+<div class="status-text" id="text-ble">玩具未连接</div>
+</div>
+
+<button class="btn btn-connect" id="btn-connect" onclick="connectBLE()">连接玩具</button>
+<button class="btn btn-stop" id="btn-stop" onclick="stopAll()">全部停止</button>
+
+<div class="motor-display">
+<div class="motor-row">
+<span class="motor-label">吮吸</span>
+<span class="motor-value" id="val-suction">0</span>
+</div>
+<div class="motor-row">
+<span class="motor-label">震动</span>
+<span class="motor-value" id="val-vibration">0</span>
+</div>
+<div class="motor-row">
+<span class="motor-label">电流</span>
+<span class="motor-value" id="val-electric">0</span>
+</div>
+</div>
+
+<div class="log" id="log"></div>
+
+<div class="hint">
+用 Kiwi Browser 打开此页面<br>
+点击"连接玩具"后选择蓝牙设备（名称以 SOSEXY 开头）<br>
+页面需保持前台，切后台可能断连<br>
+自动保活：每25秒重发指令
+</div>
+</div>
+
+<script>
+const API_BASE = 'http://127.0.0.1:8765';
+
+const SERVICE_UUID    = '0000ee01-0000-1000-8000-00805f9b34fb';
+const WRITE_CHAR_UUID = '0000ee03-0000-1000-8000-00805f9b34fb';
+const NOTIFY_CHAR_UUID= '0000ee02-0000-1000-8000-00805f9b34fb';
+
+const SUCTION_MODE    = 7;
+const VIBRATION_MODE  = 1;
+const ELECTRIC_MODE   = 3;
+
+const POLL_INTERVAL   = 800;
+const KEEPALIVE_INTERVAL = 25000;
+const MAX_WRITE_FAILS = 5;
+let writeInProgress = false;
+let pollInProgress = false;
+
+function buildFrame(mode, level) {
+    level = Math.max(0, Math.min(100, level | 0));
+    return new Uint8Array([
+        0x01, 0x01, 0x00, 0x02, 0x00,
+        mode & 0xff,
+        0x11,
+        level & 0xff,
+        0x00,
+        (mode + 1) & 0xff,
+        0x11,
+        0x01
+    ]);
+}
+
+const INIT_FRAME = new Uint8Array([0x01, 0x01, 0x00, 0x01, 0x00, 0xc8, 0x11, 0x01]);
+
+let btDevice = null;
+let gattServer = null;
+let writeChar = null;
+let notifyChar = null;
+let bleConnected = false;
+let writeFailCount = 0;
+let pollTimer = null;
+let keepaliveTimer = null;
+let watchdogTimer = null;
+let wakeLock = null;
+
+let lastSent = { suction: -1, vibration: -1, electric: -1 };
+
+function log(msg) {
+    const el = document.getElementById('log');
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const div = document.createElement('div');
+    div.textContent = '[' + time + '] ' + msg;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+    while (el.children.length > 30) el.removeChild(el.firstChild);
+}
+
+function updateUI() {
+    const dotBle = document.getElementById('dot-ble');
+    const textBle = document.getElementById('text-ble');
+    const btnConnect = document.getElementById('btn-connect');
+    if (bleConnected) {
+        dotBle.className = 'status-dot ble';
+        textBle.textContent = '玩具已连接';
+        btnConnect.textContent = '断开玩具';
+        btnConnect.disabled = false;
+    } else {
+        dotBle.className = 'status-dot';
+        textBle.textContent = btDevice ? '玩具已断开 (点击重连)' : '玩具未连接';
+        btnConnect.textContent = btDevice ? '重新连接' : '连接玩具';
+        btnConnect.disabled = false;
+    }
+}
+
+function updateMotorDisplay(data) {
+    const s = document.getElementById('val-suction');
+    const v = document.getElementById('val-vibration');
+    const e = document.getElementById('val-electric');
+    s.textContent = data.suction;
+    v.textContent = data.vibration;
+    e.textContent = data.electric;
+    s.className = 'motor-value' + (data.suction > 0 ? ' active' : '');
+    v.className = 'motor-value' + (data.vibration > 0 ? ' active' : '');
+    e.className = 'motor-value' + (data.electric > 0 ? ' active' : '');
+}
+
+async function writeFrame(frame) {
+    if (!writeChar) return false;
+    if (writeInProgress) {
+        return false;
+    }
+    writeInProgress = true;
+    try {
+        const writePromise = writeChar.writeValueWithResponse(frame);
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('write timeout')), 3000));
+        await Promise.race([writePromise, timeoutPromise]);
+        writeFailCount = 0;
+        log('写入成功');
+        return true;
+    } catch (e) {
+        log('withResponse 失败: ' + (e.message || e) + ', 尝试 withoutResponse');
+        try {
+            const writePromise2 = writeChar.writeValueWithoutResponse(frame);
+            const timeoutPromise2 = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('write timeout')), 3000));
+            await Promise.race([writePromise2, timeoutPromise2]);
+            writeFailCount = 0;
+            log('写入成功(withoutResponse)');
+            return true;
+        } catch (e2) {
+            writeFailCount++;
+            log('写入失败 x' + writeFailCount + ': ' + (e2.message || e2));
+            if (writeFailCount >= MAX_WRITE_FAILS) {
+                log('连续失败 ' + MAX_WRITE_FAILS + ' 次，判定僵尸连接');
+                handleZombie();
+            }
+            return false;
+        }
+    } finally {
+        writeInProgress = false;
+    }
+}
+
+async function sendMotor(mode, level) {
+    const frame = buildFrame(mode, level);
+    const result = await writeFrame(frame);
+    await new Promise(r => setTimeout(r, 50));
+    return result;
+}
+
+function handleZombie() {
+    if (btDevice && btDevice.gatt && btDevice.gatt.connected) {
+        try { btDevice.gatt.disconnect(); } catch(e) {}
+    }
+    onBLEDisconnected();
+}
+
+async function connectBLE() {
+    if (bleConnected) {
+        if (btDevice && btDevice.gatt && btDevice.gatt.connected) {
+            btDevice.gatt.disconnect();
+        }
+        return;
+    }
+    if (!navigator.bluetooth) {
+        log('此浏览器不支持 Web Bluetooth');
+        alert('此浏览器不支持 Web Bluetooth API');
+        return;
+    }
+    log('正在选择设备...');
+    try {
+        btDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'SOSEXY' }],
+            optionalServices: [SERVICE_UUID]
+        });
+        btDevice.addEventListener('gattserverdisconnected', onBLEDisconnected);
+        log('设备: ' + btDevice.name);
+        await doConnect();
+    } catch (e) {
+        if (e.name === 'NotFoundError') {
+            log('未找到设备，请确认玩具已开机');
+        } else {
+            log('选择设备失败: ' + (e.message || e));
+        }
+    }
+}
+
+async function doConnect() {
+    if (!btDevice) return;
+    log('正在连接 GATT...');
+    try {
+        gattServer = await btDevice.gatt.connect();
+        log('GATT 已连接');
+        const service = await gattServer.getPrimaryService(SERVICE_UUID);
+        writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
+        log('写特征已获取');
+        try {
+            notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
+            await notifyChar.startNotifications();
+            notifyChar.addEventListener('characteristicvaluechanged', onNotify);
+            log('通知已订阅');
+        } catch(e) {
+            log('通知订阅跳过: ' + (e.message || e));
+        }
+        await writeFrame(INIT_FRAME);
+        log('握手帧已发送');
+        bleConnected = true;
+        writeFailCount = 0;
+        lastSent = { suction: -1, vibration: -1, electric: -1 };
+        await fetch(API_BASE + '/connected', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ connected: true, ble: true })
+        });
+        startPolling();
+        startKeepalive();
+        startWatchdog();
+        requestWakeLock();
+        updateUI();
+        log('全部就绪');
+    } catch(e) {
+        log('连接失败: ' + (e.message || e));
+    }
+}
+
+function onBLEDisconnected() {
+    bleConnected = false;
+    writeChar = null;
+    notifyChar = null;
+    gattServer = null;
+    stopPolling();
+    stopKeepalive();
+    stopWatchdog();
+    releaseWakeLock();
+    fetch(API_BASE + '/connected', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ connected: false, ble: false })
+    }).catch(()=>{});
+    updateUI();
+    log('玩具已断开');
+}
+
+function onNotify(event) {
+    const value = event.target.value;
+}
+
+function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollState, POLL_INTERVAL);
+    pollState();
+}
+
+function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function pollState() {
+    if (pollInProgress) return;
+    pollInProgress = true;
+    try {
+        const res = await fetch(API_BASE + '/state');
+        const data = await res.json();
+        if (data.suction !== lastSent.suction) {
+            if (bleConnected && (data.suction > 0 || lastSent.suction > 0)) await sendMotor(SUCTION_MODE, data.suction);
+            lastSent.suction = data.suction;
+        }
+        if (data.vibration !== lastSent.vibration) {
+            if (bleConnected && (data.vibration > 0 || lastSent.vibration > 0)) await sendMotor(VIBRATION_MODE, data.vibration);
+            lastSent.vibration = data.vibration;
+        }
+        if (data.electric !== lastSent.electric) {
+            if (bleConnected && (data.electric > 0 || lastSent.electric > 0)) await sendMotor(ELECTRIC_MODE, data.electric);
+            lastSent.electric = data.electric;
+        }
+        updateMotorDisplay(data);
+    } catch(e) {
+    } finally {
+        pollInProgress = false;
+    }
+}
+
+function startKeepalive() {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = setInterval(() => {
+        lastSent = { suction: -1, vibration: -1, electric: -1 };
+        pollState();
+        log('保活: 重发指令');
+    }, KEEPALIVE_INTERVAL);
+}
+
+function stopKeepalive() {
+    if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+}
+
+function startWatchdog() {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    watchdogTimer = setInterval(() => {
+        if (btDevice && btDevice.gatt) {
+            if (!btDevice.gatt.connected && bleConnected) {
+                log('看门狗: 检测到断连');
+                onBLEDisconnected();
+            }
+        }
+    }, 3000);
+}
+
+function stopWatchdog() {
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+}
+
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            log('防熄屏已启用');
+        }
+    } catch(e) {
+        log('防熄屏失败: ' + (e.message || e));
+    }
+}
+
+function releaseWakeLock() {
+    if (wakeLock) {
+        try { wakeLock.release(); } catch(e) {}
+        wakeLock = null;
+    }
+}
+
+document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && bleConnected && !wakeLock) {
+        await requestWakeLock();
+    }
+});
+
+async function stopAll() {
+    try {
+        await fetch(API_BASE + '/stop', { method: 'POST' });
+        log('已停止');
+    } catch(e) {
+        log('停止失败: ' + (e.message || e));
+    }
+}
+
+async function checkServer() {
+    try {
+        const res = await fetch(API_BASE + '/state');
+        const data = await res.json();
+        document.getElementById('dot-server').className = 'status-dot online';
+        document.getElementById('text-server').textContent = '服务在线';
+        updateMotorDisplay(data);
+    } catch(e) {
+        document.getElementById('dot-server').className = 'status-dot';
+        document.getElementById('text-server').textContent = '服务未连接';
+    }
+}
+
+checkServer();
+setInterval(checkServer, 2000);
+
+log('页面已加载');
+if (!navigator.bluetooth) {
+    log('警告: 此浏览器不支持 Web Bluetooth');
+}
+</script>
+</body>
+</html>
